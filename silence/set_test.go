@@ -230,25 +230,33 @@ func TestSilenceSet(t *testing.T) {
 		requireStatesEqual(t, want, s.st, "unexpected state after silence creation")
 
 		// Should be able to update silence without modifications. It is expected to
-		// keep the same ID.
+		// keep the same ID. The merge itself is a no-op, so the version must not
+		// move.
 		sil3 := cloneSilence(sil2)
 		versionBeforeOp = s.Version()
 		require.NoError(t, s.Set(t.Context(), sil3))
 		require.Equal(t, sil2.Id, sil3.Id)
 		require.Equal(t, versionBeforeOp, s.Version())
 
+		// Advance the clock so the comment update carries a newer UpdatedAt and
+		// actually supersedes the stored silence.
+		time.Sleep(time.Millisecond)
+
 		// Should be able to update silence with comment. It is also expected to
-		// keep the same ID.
+		// keep the same ID. The in-place state change still advances the version
+		// so query-side caches observe the update.
 		sil4 := cloneSilence(sil3)
 		sil4.Comment = "c"
 		versionBeforeOp = s.Version()
 		require.NoError(t, s.Set(t.Context(), sil4))
 		require.Equal(t, sil3.Id, sil4.Id)
-		require.Equal(t, versionBeforeOp, s.Version())
+		require.NotEqual(t, versionBeforeOp, s.Version())
 
 		// Extend sil4 to expire at a later time. This should not expire the
 		// existing silence, and so should also keep the same ID.
-		time.Sleep(time.Minute - time.Nanosecond)
+		// Account for the millisecond slept before the comment update so the
+		// silence is still active when this update lands.
+		time.Sleep(time.Minute - time.Millisecond - time.Nanosecond)
 		start5 := s.nowUTC()
 		sil5 := cloneSilence(sil4)
 		sil5.EndsAt = timestamppb.New(start5.Add(100 * time.Minute))
@@ -272,7 +280,7 @@ func TestSilenceSet(t *testing.T) {
 			},
 		}
 		requireStatesEqual(t, want, s.st, "unexpected state after silence creation")
-		require.Equal(t, versionBeforeOp, s.Version())
+		require.NotEqual(t, versionBeforeOp, s.Version(), "extending a silence changes state and must bump the version")
 
 		// Replace the silence sil5 with another silence with different matchers.
 		// Unlike previous updates, changing the matchers for an existing silence

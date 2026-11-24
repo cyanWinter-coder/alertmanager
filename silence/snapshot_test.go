@@ -49,7 +49,7 @@ func TestSilencesSnapshot(t *testing.T) {
 							EndsAt:    timestamppb.New(now),
 							UpdatedAt: timestamppb.New(now),
 						},
-						ExpiresAt: timestamppb.New(now),
+						ExpiresAt: timestamppb.New(now.Add(time.Hour)),
 					},
 					{
 						Silence: &pb.Silence{
@@ -64,7 +64,7 @@ func TestSilencesSnapshot(t *testing.T) {
 							EndsAt:    timestamppb.New(now),
 							UpdatedAt: timestamppb.New(now),
 						},
-						ExpiresAt: timestamppb.New(now),
+						ExpiresAt: timestamppb.New(now.Add(2 * time.Hour)),
 					},
 					{
 						Silence: &pb.Silence{

@@ -192,6 +192,11 @@ func (s *Silences) setSilence(msil *pb.MeshSilence, now time.Time) (changed, add
 	if added {
 		s.indexSilence(msil.Silence)
 		s.updateSizeMetrics()
+	} else if changed {
+		// An in-place update (for example expiring or editing a silence) does
+		// not add a version index entry but still changes the state, so the
+		// version must advance for query-side caches to notice it.
+		s.bumpVersion()
 	}
 	if changed {
 		s.broadcast(b)

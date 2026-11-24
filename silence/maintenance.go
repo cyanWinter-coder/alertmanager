@@ -97,64 +97,81 @@ Loop:
 
 // GC runs a garbage collection that removes silences that have ended longer
 // than the configured retention time ago.
+//
+// The collection is atomic: it first determines all expired entries and only
+// applies the deletions once the whole state has been validated. If any entry
+// is invalid, an error is returned and the state is left completely untouched,
+// so no unexpired silence can ever be lost through a failed maintenance run.
 func (s *Silences) GC() (int, error) {
 	start := time.Now()
 	defer func() { s.metrics.gcDuration.Observe(time.Since(start).Seconds()) }()
 
 	now := s.nowUTC()
-	var n int
 	var errs error
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	// During GC we will delete expired silences from the state map and the indices.
-	// If between the last GC's deletion, and including any silences that were added
-	// until now, we have more than 50% spare capacity, we want to reallocate to a smaller
-	// slice, while still leaving some growth buffer.
-	needsRealloc := cap(s.vi) > 1024 && len(s.vi) < cap(s.vi)/2
+	// Phase 1: validate the whole state and collect the silences eligible for
+	// garbage collection without mutating anything. A dangling version index
+	// entry or a zero expiration timestamp aborts the whole collection.
+	var expiredIDs []string
+	for _, sv := range s.vi {
+		sil, ok := s.st[sv.id]
+		if !ok {
+			s.metrics.gcErrorsTotal.Inc()
+			errs = errors.Join(errs, fmt.Errorf("silence %s in version index missing from state", sv.id))
+			continue
+		}
+		if sil.ExpiresAt == nil || sil.ExpiresAt.AsTime().IsZero() {
+			s.metrics.gcErrorsTotal.Inc()
+			errs = errors.Join(errs, fmt.Errorf("silence %s has zero expiration timestamp", sil.Silence.Id))
+			continue
+		}
+		if !sil.ExpiresAt.AsTime().After(now) {
+			expiredIDs = append(expiredIDs, sil.Silence.Id)
+		}
+	}
+	if errs != nil {
+		// Do not apply any deletion: callers must keep every unexpired entry.
+		return 0, errs
+	}
+	if len(expiredIDs) == 0 {
+		return 0, nil
+	}
 
+	// Phase 2: apply all deletions against the validated state.
+	expired := make(map[string]struct{}, len(expiredIDs))
+	for _, id := range expiredIDs {
+		expired[id] = struct{}{}
+		delete(s.st, id)
+		delete(s.mi, id)
+	}
+
+	// During GC we delete expired silences from the state map and the indices.
+	// If after the deletion we have more than 50% spare capacity, reallocate
+	// the version index to a smaller slice while leaving some growth buffer.
+	needsRealloc := cap(s.vi) > 1024 && len(s.vi)-len(expired) < cap(s.vi)/2
 	var targetVi versionIndex
 	if needsRealloc {
-		// Allocate new slice with growth buffer.
-		newCap := max(len(s.vi)*5/4, 1024)
+		newCap := max((len(s.vi)-len(expired))*5/4, 1024)
 		targetVi = make(versionIndex, 0, newCap)
 	} else {
 		targetVi = s.vi[:0]
 	}
-
-	// Iterate state map directly (fast - no extra lookups).
 	for _, sv := range s.vi {
-		sil, ok := s.st[sv.id]
-		expire := false
-		if !ok {
-			// Silence in version index but not in state - remove from version index and count error
-			s.metrics.gcErrorsTotal.Inc()
-			errs = errors.Join(errs, fmt.Errorf("silence %s in version index missing from state", sv.id))
-			// not adding to targetVi effectively removes it
+		if _, ok := expired[sv.id]; ok {
 			continue
 		}
-		if sil.ExpiresAt == nil || sil.ExpiresAt.AsTime().IsZero() {
-			// Invalid expiration timestamp - remove silence and count error
-			s.metrics.gcErrorsTotal.Inc()
-			errs = errors.Join(errs, fmt.Errorf("silence %s has zero expiration timestamp", sil.Silence.Id))
-			expire = true
-		}
-		if expire || !sil.ExpiresAt.AsTime().After(now) {
-			delete(s.st, sil.Silence.Id)
-			delete(s.mi, sil.Silence.Id)
-			n++
-		} else {
-			targetVi = append(targetVi, sv)
-		}
+		targetVi = append(targetVi, sv)
 	}
-
 	if !needsRealloc {
-		// If we didn't reallocate, clear tail to prevent string pointer leaks
+		// Clear tail to prevent string pointer leaks.
 		clear(s.vi[len(targetVi):])
 	}
 	s.vi = targetVi
+	s.bumpVersion()
 	s.updateSizeMetrics()
 
-	return n, errs
+	return len(expiredIDs), nil
 }

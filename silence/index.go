@@ -101,12 +101,22 @@ func (s versionIndex) findVersionGreaterThan(version int) (index int, found bool
 	return startIdx, startIdx < len(s)
 }
 
+// indexSilence compiles and indexes the matchers of a newly added silence and
+// records it in the version index under a freshly bumped state version.
+// It must be called while holding s.mtx.
 func (s *Silences) indexSilence(sil *pb.Silence) {
-	s.version++
+	s.bumpVersion()
 	s.vi.add(s.version, sil.Id)
-	_, err := s.mi.add(sil)
-	if err != nil {
+	if _, err := s.mi.add(sil); err != nil {
 		s.metrics.matcherCompileIndexSilenceErrorsTotal.Inc()
 		s.logger.Error("Failed to compile silence matchers", "silence_id", sil.Id, "err", err)
 	}
+}
+
+// bumpVersion advances the state version by one. Every state change (adding,
+// updating, expiring or garbage collecting silences) must bump the version so
+// that query-side caches observing Version() never act on a stale state.
+// It must be called while holding s.mtx.
+func (s *Silences) bumpVersion() {
+	s.version++
 }

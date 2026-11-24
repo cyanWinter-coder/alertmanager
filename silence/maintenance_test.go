@@ -290,7 +290,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}
 	})
 
-	test.SyncTestRun("GC continues and removes erroneous silences", t, func(t *testing.T) {
+	test.SyncTestRun("GC aborts and preserves all silences on invalid entries", t, func(t *testing.T) {
 		reg := prometheus.NewRegistry()
 		s, err := New(Options{Metrics: reg})
 		require.NoError(t, err)
@@ -337,21 +337,25 @@ func TestSilenceGCOverTime(t *testing.T) {
 
 		require.Len(t, s.st, 2)
 		require.Len(t, s.vi, 3)
+		versionBeforeGC := s.Version()
 
-		// Run GC - should continue despite errors
+		// Run GC - the invalid entries must abort the whole collection so that
+		// the state remains untouched.
 		n, err := s.GC()
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "zero expiration timestamp")
 		require.Contains(t, err.Error(), "missing from state")
 
-		// GC should have removed erroneous silences
-		require.Equal(t, 1, n) // Only the erroneous silence with zero expiration
-		require.Len(t, s.st, 1)
-		require.Len(t, s.vi, 1)
+		// Nothing must have been removed: a failed GC preserves every entry.
+		require.Equal(t, 0, n)
+		require.Len(t, s.st, 2)
+		require.Len(t, s.vi, 3)
 		require.Contains(t, s.st, validID)
-		require.NotContains(t, s.st, "erroneous")
+		require.Contains(t, s.st, "erroneous")
+		// A failed GC does not change the version.
+		require.Equal(t, versionBeforeGC, s.Version())
 
-		// Check that the error metric was incremented
+		// Check that the error metric was incremented.
 		metricValue := testutil.ToFloat64(s.metrics.gcErrorsTotal)
 		require.Equal(t, float64(2), metricValue)
 	})
