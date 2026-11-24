@@ -180,7 +180,7 @@ func TestInhibitRuleHasEqual(t *testing.T) {
 			r := &InhibitRule{
 				TargetMatchers: c.targetMatchers,
 				Equal:          equal,
-				cache:          newCache(equal),
+				cache:          newCache(equal, "", nil),
 			}
 			for _, v := range c.initial {
 				r.cache.set(v)
@@ -445,8 +445,8 @@ func TestInhibitRuleName(t *testing.T) {
 		Equal: []string{"instance"},
 	}
 
-	rule1 := NewInhibitRule(config1)
-	rule2 := NewInhibitRule(config2)
+	rule1 := NewInhibitRule(config1, nil)
+	rule2 := NewInhibitRule(config2, nil)
 
 	require.Equal(t, "test-rule", rule1.Name, "Expected named rule to have adopt name from config")
 	require.Empty(t, rule2.Name, "Expected unnamed rule to have empty name")
@@ -622,7 +622,7 @@ func TestInhibitRule_fingerprintEquals(t *testing.T) {
 	c := newCache(map[model.LabelName]struct{}{
 		"cluster": {},
 		"service": {},
-	})
+	}, "", nil)
 
 	lset := model.LabelSet{
 		"cluster":  "prod",
@@ -650,7 +650,7 @@ func TestInhibitRule_fingerprintEquals(t *testing.T) {
 
 func TestInhibitRuleIndexSurvivesGC(t *testing.T) {
 	now := time.Now()
-	r := NewInhibitRule(amcommoncfg.InhibitRule{Equal: []string{"cluster"}})
+	r := NewInhibitRule(amcommoncfg.InhibitRule{Equal: []string{"cluster"}}, nil)
 
 	active := alert.New(model.Alert{
 		Labels:   model.LabelSet{"alertname": "S1", "cluster": "c1"},
@@ -693,7 +693,7 @@ func TestInhibitRuleTwoSidedDoesNotShadow(t *testing.T) {
 	r := NewInhibitRule(amcommoncfg.InhibitRule{
 		TargetMatchers: amcommoncfg.Matchers{&labels.Matcher{Type: labels.MatchEqual, Name: "severity", Value: "warning"}},
 		Equal:          []string{"cluster"},
-	})
+	}, nil)
 
 	sourceOnly := alert.New(model.Alert{
 		Labels:   model.LabelSet{"alertname": "S1", "cluster": "c1", "severity": "critical"},
@@ -723,7 +723,7 @@ func BenchmarkFingerprintEquals(b *testing.B) {
 				equalLabels[model.LabelName(fmt.Sprintf("label_%d", i))] = struct{}{}
 			}
 
-			c := newCache(equalLabels)
+			c := newCache(equalLabels, "", nil)
 
 			// Create a label set with matching values
 			lset := make(model.LabelSet, numLabels+2)

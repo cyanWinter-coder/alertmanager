@@ -67,7 +67,7 @@ func NewInhibitor(ap provider.Alerts, rs []amcommoncfg.InhibitRule, logger *slog
 			ih.logger.Debug("duplicate inhibition rule name", "index", i, "name", cr.Name)
 		}
 
-		r := NewInhibitRule(cr)
+		r := NewInhibitRule(cr, ih.logger)
 		ih.rules = append(ih.rules, r)
 
 		if cr.Name != "" {
@@ -230,7 +230,7 @@ type InhibitRule struct {
 }
 
 // NewInhibitRule returns a new InhibitRule based on a configuration definition.
-func NewInhibitRule(cr amcommoncfg.InhibitRule) *InhibitRule {
+func NewInhibitRule(cr amcommoncfg.InhibitRule, logger *slog.Logger) *InhibitRule {
 	var (
 		sourcem labels.Matchers
 		targetm labels.Matchers
@@ -288,7 +288,7 @@ func NewInhibitRule(cr amcommoncfg.InhibitRule) *InhibitRule {
 		SourceMatchers: sourcem,
 		TargetMatchers: targetm,
 		Equal:          equal,
-		cache:          newCache(equal),
+		cache:          newCache(equal, cr.Name, logger),
 	}
 }
 
