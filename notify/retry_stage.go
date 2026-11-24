@@ -21,23 +21,37 @@ import (
 
 	"github.com/cenkalti/backoff/v5"
 	"github.com/prometheus/common/model"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/prometheus/alertmanager/alert"
 	"github.com/prometheus/alertmanager/eventrecorder"
 )
 
+// retryMaxElapsedTime bounds the total time spent retrying a notification.
+// Exponential backoff alone only caps the delay between two attempts, so a
+// permanently failing integration would otherwise retry until the pipeline
+// context ended; with this cap the stage gives up and returns the last error,
+// leaving the notification unlogged so a later flush can try again.
+const retryMaxElapsedTime = 5 * time.Minute
+
 // RetryStage notifies via passed integration with exponential backoff until it
-// succeeds. It aborts if the context is canceled or timed out.
+// succeeds, the retry budget is exhausted or the context is canceled.
+// Concurrent executions for the same aggregation group and the same batch of
+// alerts share a single delivery, so a receiver is never notified twice for
+// one notification batch.
 type RetryStage struct {
 	integration Integration
 	groupName   string
 	metrics     *Metrics
 	labelValues []string
 	recorder    eventrecorder.Recorder
+	inflight    *inflightRegistry
 }
 
-// NewRetryStage returns a new instance of a RetryStage.
-func NewRetryStage(i Integration, groupName string, metrics *Metrics, recorder eventrecorder.Recorder) *RetryStage {
+// NewRetryStage returns a new instance of a RetryStage. The inflight registry
+// must be shared by the stages built for one pipeline so that concurrent
+// deliveries of the same notification batch coalesce.
+func NewRetryStage(i Integration, groupName string, metrics *Metrics, recorder eventrecorder.Recorder, inflight *inflightRegistry) *RetryStage {
 	labelValues := []string{i.Name()}
 
 	if metrics.ff.EnableReceiverNamesInMetrics() {
@@ -50,6 +64,7 @@ func NewRetryStage(i Integration, groupName string, metrics *Metrics, recorder e
 		metrics:     metrics,
 		labelValues: labelValues,
 		recorder:    recorder,
+		inflight:    inflight,
 	}
 }
 
@@ -66,21 +81,70 @@ func (r RetryStage) Exec(ctx context.Context, l *slog.Logger, alerts ...*alert.A
 	defer span.End()
 
 	l = l.With("receiver", r.groupName, "integration", r.integration.String())
-	if groupKey, ok := GroupKey(ctx); ok {
-		l = l.With("aggrGroup", groupKey)
+	gkey, hasGroupKey := GroupKey(ctx)
+	if hasGroupKey {
+		l = l.With("aggrGroup", gkey)
+	}
+
+	// Coalesce with a delivery of the same batch already in progress. Without a
+	// group key (e.g. unit tests calling the stage directly) dedup is skipped.
+	if hasGroupKey && r.inflight != nil {
+		key := inflightKey(gkey, r.integration, alerts)
+		leader, call, finish := r.inflight.joinOrStart(key)
+		if !leader {
+			err := call.wait(ctx)
+			if err != nil {
+				r.recordFailure(ctx, span, l, r.coalescedFailureReason(err), err)
+			}
+			return ctx, alerts, err
+		}
+
+		ctx, alerts, err := r.deliver(ctx, span, l, alerts...)
+		finish(err)
+		if err != nil {
+			return ctx, nil, err
+		}
+		return ctx, alerts, nil
 	}
 
 	ctx, alerts, failureReason, err := r.exec(ctx, l, alerts...)
 	if err != nil {
-		r.integration.recordFailure(span, failureReason, err)
-		r.metrics.numTotalFailedNotifications.WithLabelValues(append(r.labelValues, failureReason.String())...).Inc()
-		if errors.Is(ctx.Err(), context.Canceled) {
-			l.Debug("Notify failed", "reason", failureReason.String(), "err", err)
-		} else {
-			l.Error("Notify failed", "reason", failureReason.String(), "err", err)
-		}
+		r.recordFailure(ctx, span, l, failureReason, err)
 	}
 	return ctx, alerts, err
+}
+
+// deliver runs the retry loop and records the leader's outcome on its own span
+// and failure metrics. Followers reuse the returned error without recording it
+// a second time.
+func (r RetryStage) deliver(ctx context.Context, span trace.Span, l *slog.Logger, alerts ...*alert.Alert) (context.Context, []*alert.Alert, error) {
+	ctx, _, failureReason, err := r.exec(ctx, l, alerts...)
+	if err != nil {
+		r.recordFailure(ctx, span, l, failureReason, err)
+	}
+	return ctx, alerts, err
+}
+
+// coalescedFailureReason maps the error a follower observed while waiting on
+// the leader to the reason recorded on the follower's own span and metrics.
+func (r RetryStage) coalescedFailureReason(err error) Reason {
+	if errors.Is(err, context.Canceled) {
+		return ContextCanceledReason
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ContextDeadlineExceededReason
+	}
+	return DefaultReason
+}
+
+func (r RetryStage) recordFailure(ctx context.Context, span trace.Span, l *slog.Logger, failureReason Reason, err error) {
+	r.integration.recordFailure(span, failureReason, err)
+	r.metrics.numTotalFailedNotifications.WithLabelValues(append(r.labelValues, failureReason.String())...).Inc()
+	if errors.Is(ctx.Err(), context.Canceled) {
+		l.Debug("Notify failed", "reason", failureReason.String(), "err", err)
+	} else {
+		l.Error("Notify failed", "reason", failureReason.String(), "err", err)
+	}
 }
 
 func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.Alert) (context.Context, []*alert.Alert, Reason, error) {
@@ -106,26 +170,30 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.A
 		sent = alerts
 	}
 
-	// backoff/v5's ExponentialBackOff never returns Stop from NextBackOff, so
-	// we retry indefinitely until the context is canceled.
+	// Exponential backoff grows the delay between attempts up to MaxInterval.
+	// The total retry time is bounded separately by the deadline below, since
+	// ExponentialBackOff itself never stops retrying.
 	b := backoff.NewExponentialBackOff()
 	// Redundant for a freshly constructed ExponentialBackOff, but the BackOff
 	// docs require Reset before first use.
 	b.Reset()
+
+	deadline := time.Now().Add(retryMaxElapsedTime)
 
 	// Zero delay so the first attempt happens immediately.
 	tick := time.NewTimer(0)
 	defer tick.Stop()
 
 	var (
-		i       = 0
-		iErr    error
-		iReason Reason
+		i          = 0
+		iErr       error
+		iReason    Reason
+		retryAfter time.Duration
 	)
 
 	for {
-
-		// Always check the context first to not notify again.
+		// Always check the context first: a canceled pipeline returns
+		// immediately and never schedules another attempt.
 		select {
 		case <-ctx.Done():
 			if iErr == nil {
@@ -144,6 +212,16 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.A
 		default:
 		}
 
+		// The retry budget is spent. Give up and return the last error instead
+		// of scheduling another attempt; nothing is written to the
+		// notification log, so a later flush retries the group.
+		if i > 0 && !time.Now().Before(deadline) {
+			if iErr == nil {
+				iErr = errors.New("no error recorded")
+			}
+			return ctx, nil, RetryBudgetExhaustedReason, fmt.Errorf("%s/%s: notify retry budget exhausted after %d attempts over %s, last error: %w", r.groupName, r.integration.String(), i, retryMaxElapsedTime, iErr)
+		}
+
 		select {
 		case <-tick.C:
 			now := time.Now()
@@ -152,7 +230,7 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.A
 			dur := time.Since(now)
 			// Back off from the end of the attempt, not from its start, so a
 			// slow failure doesn't eat into the wait.
-			tick.Reset(max(b.NextBackOff(), verdict.Delay()))
+			retryAfter = verdict.Delay()
 			r.metrics.notificationLatencySeconds.WithLabelValues(r.labelValues...).Observe(dur.Seconds())
 			r.metrics.numNotificationRequestsTotal.WithLabelValues(r.labelValues...).Inc()
 			if err := verdict.Err(); err != nil {
@@ -189,6 +267,19 @@ func (r RetryStage) exec(ctx context.Context, l *slog.Logger, alerts ...*alert.A
 				return ctx, alerts, DefaultReason, nil
 			}
 		case <-ctx.Done():
+			// Loop back to the top so the context error is returned by a
+			// single code path and no further attempt is scheduled.
+			continue
 		}
+
+		delay := max(b.NextBackOff(), retryAfter)
+		// Never wait past the retry budget: the next loop iteration detects
+		// the exhausted budget and returns the last error. Cancellation stays
+		// responsive regardless, since the timer is selected alongside
+		// ctx.Done() above.
+		if remaining := time.Until(deadline); delay > remaining {
+			delay = remaining
+		}
+		tick.Reset(delay)
 	}
 }

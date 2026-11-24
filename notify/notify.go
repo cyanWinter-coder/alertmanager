@@ -196,6 +196,7 @@ type PipelineBuilder struct {
 	metrics  *Metrics
 	ff       featurecontrol.Flagger
 	recorder eventrecorder.Recorder
+	inflight *inflightRegistry
 }
 
 func NewPipelineBuilder(r prometheus.Registerer, ff featurecontrol.Flagger, recorder eventrecorder.Recorder) *PipelineBuilder {
@@ -203,6 +204,7 @@ func NewPipelineBuilder(r prometheus.Registerer, ff featurecontrol.Flagger, reco
 		metrics:  NewMetrics(r, ff),
 		ff:       ff,
 		recorder: recorder,
+		inflight: newInflightRegistry(),
 	}
 }
 
@@ -225,7 +227,7 @@ func (pb *PipelineBuilder) New(
 	ss := NewMuteStage(silencer, pb.metrics)
 
 	for name := range receivers {
-		st := createReceiverStage(name, receivers[name], wait, notificationLog, pb.metrics, pb.recorder, pb.ff)
+		st := createReceiverStage(name, receivers[name], wait, notificationLog, pb.metrics, pb.recorder, pb.ff, pb.inflight)
 		if pb.ff.EnableMutedAlertsInNflog() {
 			rs[name] = MutedMultiStage{ms, is, tas, tms, ss, st}
 			continue
@@ -247,6 +249,7 @@ func createReceiverStage(
 	metrics *Metrics,
 	recorder eventrecorder.Recorder,
 	ff featurecontrol.Flagger,
+	inflight *inflightRegistry,
 ) Stage {
 	var fs FanoutStage
 	for i := range integrations {
@@ -258,7 +261,7 @@ func createReceiverStage(
 		stages := []Stage{
 			NewClusterWaitStage(wait),
 			NewDedupStage(&integrations[i], notificationLog, recv),
-			NewRetryStage(integrations[i], name, metrics, recorder),
+			NewRetryStage(integrations[i], name, metrics, recorder, inflight),
 			NewSetNotifiesStage(notificationLog, recv, ff),
 		}
 

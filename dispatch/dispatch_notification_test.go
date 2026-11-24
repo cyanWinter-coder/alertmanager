@@ -143,7 +143,7 @@ func newTestNotificationPipeline(t *testing.T) (notify.Stage, *notificationRecor
 	return notify.RoutingStage{"team": notify.MultiStage{
 		recorder,
 		notify.NewDedupStage(&integration, log, receiver),
-		notify.NewRetryStage(integration, "team", metrics, eventrecorder.NopRecorder()),
+		notify.NewRetryStage(integration, "team", metrics, eventrecorder.NopRecorder(), nil),
 		notify.NewSetNotifiesStage(log, receiver, flags),
 	}}, recorder
 }

@@ -310,6 +310,7 @@ const (
 	EncodingErrorReason
 	RequestErrorReason
 	MissingContextReason
+	RetryBudgetExhaustedReason
 )
 
 func (s Reason) String() string {
@@ -340,6 +341,8 @@ func (s Reason) String() string {
 		return "requestError"
 	case MissingContextReason:
 		return "missingContext"
+	case RetryBudgetExhaustedReason:
+		return "retryBudgetExhausted"
 	default:
 		panic(fmt.Sprintf("unknown Reason: %d", s))
 	}
@@ -360,6 +363,7 @@ var possibleFailureReasonCategory = []string{
 	EncodingErrorReason.String(),
 	RequestErrorReason.String(),
 	MissingContextReason.String(),
+	RetryBudgetExhaustedReason.String(),
 }
 
 // GetFailureReasonFromStatusCode returns the reason for the failure based on the status code provided.
