@@ -102,7 +102,7 @@ func TestSilencesSnapshot(t *testing.T) {
 			require.NoError(t, err, "opening snapshot file failed")
 
 			// Check again against new nlog instance.
-			s2 := &Silences{mi: matcherIndex{}, st: state{}}
+			s2 := &Silences{mi: newMatcherIndex(0), st: state{}}
 			err = s2.loadSnapshot(f)
 			require.NoError(t, err, "error loading snapshot")
 			require.Len(t, s2.st, len(s1.st), "state length mismatch after loading snapshot")

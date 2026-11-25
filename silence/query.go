@@ -34,6 +34,11 @@ type query struct {
 	ids     []string
 	since   *int
 	filters []silenceFilter
+	// matchSet is set by QMatches. When present, the label index narrows the
+	// candidate silences before the full matcher evaluation runs.
+	matchSet model.LabelSet
+	// matchSetSet distinguishes "QMatches was used" from a nil label set.
+	matchSetSet bool
 }
 
 // silenceFilter is a function that returns true if a silence
@@ -68,9 +73,20 @@ func QSince(version int) QueryParam {
 }
 
 // QMatches returns silences that match the given label set.
+//
+// The label index first narrows the candidate silences to those whose equality
+// matchers can possibly match set; the full matcher set (including regex and
+// negation matchers) is then evaluated only against those candidates.
+// Expired silences are never returned.
 func QMatches(set model.LabelSet) QueryParam {
 	return func(q *query) error {
-		f := func(sil *pb.Silence, s *Silences, _ time.Time) (bool, error) {
+		q.matchSet = set
+		q.matchSetSet = true
+		f := func(sil *pb.Silence, s *Silences, at time.Time) (bool, error) {
+			// Expired silences never match, regardless of their labels.
+			if StateFromProtoAt(sil, at) == SilenceStateExpired {
+				return false, nil
+			}
 			m, err := s.mi.get(sil)
 			if err != nil {
 				return true, err
@@ -258,6 +274,21 @@ func (s *Silences) CountState(ctx context.Context, states ...SilenceState) (int,
 	return count, nil
 }
 
+// snapshot is a point-in-time, immutable view of the silence state and its
+// indices. It is captured under the read lock at the start of a query and
+// referenced for the query's whole duration, so silences added or deleted
+// while the query runs do not affect its result. The backing maps are mutated
+// in place by writers (who hold the write lock), so the snapshot may only be
+// read while its read lock is held; the query keeps that lock until done.
+type snapshot struct {
+	st      state
+	vi      versionIndex
+	version int
+	// candidates is the label-index narrowed candidate set for a QMatches
+	// query, nil when no label matching was requested.
+	candidates idSet
+}
+
 // query executes the given query and returns the resulting silences.
 func (s *Silences) query(ctx context.Context, q *query, now time.Time) ([]*pb.Silence, int, error) {
 	if err := ctx.Err(); err != nil {
@@ -289,12 +320,35 @@ func (s *Silences) query(ctx context.Context, q *query, now time.Time) ([]*pb.Si
 		return append(res, sil), nil
 	}
 
-	// Take a read lock on Silences: we can read but not modify the Silences struct.
+	// Take a read lock on Silences and capture a snapshot of everything the
+	// query will read. The lock is held for the whole evaluation because the
+	// snapshot shares the live backing maps: writers mutate those maps under
+	// the write lock, and Go maps are not safe for concurrent read/write.
+	// Holding the read lock gives each query a stable point-in-time view while
+	// still allowing many readers to run concurrently.
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
+	snap := snapshot{
+		st:      s.st,
+		vi:      s.vi,
+		version: s.version,
+	}
+	if q.matchSetSet {
+		snap.candidates = s.mi.candidates(q.matchSet)
+	}
+
+	// considerCandidate reports whether a silence survives the label-index
+	// narrowing. Without QMatches every silence is considered.
+	considerCandidate := func(id string) bool {
+		if snap.candidates == nil {
+			return true
+		}
+		return snap.candidates.contains(id)
+	}
+
 	if err := ctx.Err(); err != nil {
-		return nil, s.version, err
+		return nil, snap.version, err
 	}
 
 	// If we have IDs, only consider the silences with the given IDs, if they exist.
@@ -302,52 +356,65 @@ func (s *Silences) query(ctx context.Context, q *query, now time.Time) ([]*pb.Si
 		res = make([]*pb.Silence, 0, len(q.ids))
 		for _, id := range q.ids {
 			if err := ctx.Err(); err != nil {
-				return nil, s.version, err
+				return nil, snap.version, err
 			}
-			if sil, ok := s.st[id]; ok {
+			if !considerCandidate(id) {
+				continue
+			}
+			if sil, ok := snap.st[id]; ok {
 				scannedCount++
 				// append the silence to the results if it satisfies the query.
 				res, err = appendIfFiltersMatch(res, sil.Silence)
 				if err != nil {
-					return nil, s.version, err
+					return nil, snap.version, err
 				}
 			}
 		}
-	} else {
-		start := 0
-		if q.since != nil {
-			var found bool
-			start, found = s.vi.findVersionGreaterThan(*q.since)
-			// no new silences, nothing to do
-			if !found {
-				return res, s.version, nil
-			}
-			// Track how many silences we skipped using the version index.
-			s.metrics.querySkippedTotal.Add(float64(start))
+		return res, snap.version, nil
+	}
+
+	start := 0
+	if q.since != nil {
+		var found bool
+		start, found = snap.vi.findVersionGreaterThan(*q.since)
+		// no new silences, nothing to do
+		if !found {
+			return res, snap.version, nil
 		}
-		// Unfiltered queries return every scanned silence.
-		// Limit initial capacity for filtered queries.
-		capacity := len(s.vi) - start
-		if len(q.filters) > 0 {
-			capacity = min(64, capacity)
+		// Track how many silences we skipped using the version index.
+		s.metrics.querySkippedTotal.Add(float64(start))
+	}
+	// Unfiltered queries return every scanned silence.
+	// Limit initial capacity for filtered queries.
+	capacity := len(snap.vi) - start
+	if len(q.filters) > 0 {
+		capacity = min(64, capacity)
+	}
+	res = make([]*pb.Silence, 0, capacity)
+	for _, sv := range snap.vi[start:] {
+		if err := ctx.Err(); err != nil {
+			return nil, snap.version, err
 		}
-		res = make([]*pb.Silence, 0, capacity)
-		for _, sv := range s.vi[start:] {
-			if err := ctx.Err(); err != nil {
-				return nil, s.version, err
-			}
-			scannedCount++
-			sil := s.st[sv.id]
-			// append the silence to the results if it satisfies the query.
-			res, err = appendIfFiltersMatch(res, sil.Silence)
-			if err != nil {
-				return nil, s.version, err
-			}
+		if !considerCandidate(sv.id) {
+			continue
+		}
+		sil, ok := snap.st[sv.id]
+		if !ok {
+			// A version-index entry with no state would be a dangling reference.
+			// Deletions synchronize both structures, so this should not happen;
+			// skip it defensively rather than panicking on a nil dereference.
+			continue
+		}
+		scannedCount++
+		// append the silence to the results if it satisfies the query.
+		res, err = appendIfFiltersMatch(res, sil.Silence)
+		if err != nil {
+			return nil, snap.version, err
 		}
 	}
 
 	if err := ctx.Err(); err != nil {
-		return nil, s.version, err
+		return nil, snap.version, err
 	}
-	return res, s.version, nil
+	return res, snap.version, nil
 }

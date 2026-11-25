@@ -153,7 +153,7 @@ func newMetrics(r prometheus.Registerer, s *Silences) *metrics {
 func (s *Silences) updateSizeMetrics() {
 	if s.metrics != nil && s.metrics.stateSize != nil {
 		s.metrics.stateSize.Set(float64(len(s.st)))
-		s.metrics.matcherIndexSize.Set(float64(len(s.mi)))
+		s.metrics.matcherIndexSize.Set(float64(len(s.mi.entries)))
 		s.metrics.versionIndexSize.Set(float64(len(s.vi)))
 	}
 }

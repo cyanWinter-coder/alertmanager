@@ -142,7 +142,10 @@ func (s *Silences) GC() (int, error) {
 		}
 		if expire || !sil.ExpiresAt.AsTime().After(now) {
 			delete(s.st, sil.Silence.Id)
-			delete(s.mi, sil.Silence.Id)
+			// Remove every index reference (compiled matchers, label postings
+			// and the unindexed fallback) in one synchronized step so no
+			// dangling silence ID survives the state deletion.
+			s.deindexSilence(sil.Silence.Id)
 			n++
 		} else {
 			targetVi = append(targetVi, sv)

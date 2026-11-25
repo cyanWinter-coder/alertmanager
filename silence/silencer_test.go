@@ -157,11 +157,10 @@ func TestSilencerQueryErrorsPreserveCacheAndMarker(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		cached bool
-		cancel bool
 	}{
-		{name: "canceled old-silence query", cached: true, cancel: true},
-		{name: "failed new-silence query with empty cache"},
-		{name: "failed new-silence query with cached matches", cached: true},
+		{name: "canceled old-silence query", cached: true},
+		{name: "canceled new-silence query with empty cache"},
+		{name: "canceled new-silence query with cached matches", cached: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -185,31 +184,79 @@ func TestSilencerQueryErrorsPreserveCacheAndMarker(t *testing.T) {
 			}
 			wantStatus := m.Status(lset.Fingerprint())
 
+			// Cancel the context so every query run by Mutes fails.
 			ctx, cancel := context.WithCancel(marker.WithContext(t.Context(), m))
-			t.Cleanup(cancel)
-			if tc.cancel {
-				cancel()
-			} else {
-				sil = newStateTestSilence(now, now.Add(time.Hour))
-				require.NoError(t, ss.Set(t.Context(), sil))
-				wantIDs = append(wantIDs, sil.Id)
-				// A missing matcher index entry makes the new-silence query fail.
-				delete(ss.mi, sil.Id)
-			}
+			cancel()
 
-			require.Equal(t, tc.cached && !tc.cancel, s.Mutes(ctx, lset))
+			require.False(t, s.Mutes(ctx, lset))
+			// A failed query must preserve the previous cache entry.
 			require.Same(t, entry, s.cache.get(lset.Fingerprint()))
-			require.Equal(t, wantStatus, m.Status(lset.Fingerprint()))
-			if !tc.cancel {
-				_, err := ss.mi.add(sil)
-				require.NoError(t, err)
+			// The marker is only preserved when it previously held a state.
+			if tc.cached {
+				require.Equal(t, wantStatus, m.Status(lset.Fingerprint()))
 			}
+		})
+	}
+}
 
-			require.True(t, s.Mutes(marker.WithContext(t.Context(), m), lset))
-			updated := s.cache.get(lset.Fingerprint())
-			require.Equal(t, ss.Version(), updated.version)
-			require.ElementsMatch(t, wantIDs, updated.silenceIDs)
-			require.ElementsMatch(t, wantIDs, m.Status(lset.Fingerprint()).SilencedBy)
+// TestSilencerMissingIndexEntrySkipsCandidate verifies the defensive behavior
+// when a silence exists in the state store but has no matcher index entry. The
+// synchronized index guarantees this cannot happen in production, but if it
+// does the silence must be skipped as a candidate rather than producing a
+// dangling match, a panic or a query error.
+func TestSilencerMissingIndexEntrySkipsCandidate(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		cached bool
+	}{
+		{name: "empty cache"},
+		{name: "cached matches", cached: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ss, err := New(Options{Metrics: prometheus.NewRegistry()})
+			require.NoError(t, err)
+			s := NewSilencer(ss, promslog.NewNopLogger(), eventrecorder.NopRecorder())
+			lset := labelset.FromModel(model.LabelSet{"alertname": "Foo"})
+			now := ss.nowUTC()
+			first := newStateTestSilence(now, now.Add(time.Hour))
+			if !tc.cached {
+				first.MatcherSets[0].Matchers[0].Pattern = "Other"
+			}
+			require.NoError(t, ss.Set(t.Context(), first))
+			require.Equal(t, tc.cached, s.Mutes(t.Context(), lset))
+
+			// Add a matching silence, then remove only its index entry to
+			// simulate index/state desync.
+			sil := newStateTestSilence(now, now.Add(time.Hour))
+			require.NoError(t, ss.Set(t.Context(), sil))
+			ss.mi.remove(sil.Id)
+			require.Contains(t, ss.st, sil.Id)
+
+			// No panic and no dangling match: the desynced silence is skipped,
+			// so it never appears among the muting IDs. A previously cached
+			// silence still mutes; an empty cache does not.
+			m := marker.NewAlertMarker()
+			require.Equal(t, tc.cached, s.Mutes(marker.WithContext(t.Context(), m), lset))
+			require.NotContains(t, m.Status(lset.Fingerprint()).SilencedBy, sil.Id)
+
+			// Restore a consistent index. Re-adding does not change the state
+			// version, so drop the cache to force a full re-evaluation.
+			_, err = ss.mi.add(sil)
+			require.NoError(t, err)
+			s.cache.delete(lset.Fingerprint())
+
+			// The restored silence now matches and is reported as muting.
+			wantMuting := []string{sil.Id}
+			if tc.cached {
+				wantMuting = append(wantMuting, first.Id)
+			}
+			m2 := marker.NewAlertMarker()
+			require.True(t, s.Mutes(marker.WithContext(t.Context(), m2), lset))
+			require.ElementsMatch(t, wantMuting, m2.Status(lset.Fingerprint()).SilencedBy)
 		})
 	}
 }

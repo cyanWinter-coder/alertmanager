@@ -75,7 +75,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}
 		require.NoError(t, s.Set(t.Context(), sil1))
 		require.Len(t, s.st, 1)
-		require.Len(t, s.mi, 1)
+		require.Len(t, s.mi.entries, 1)
 		// Move time forward and both silence and cache entry should be garbage
 		// collected.
 		time.Sleep(time.Minute)
@@ -83,7 +83,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 		require.Empty(t, s.st)
-		require.Empty(t, s.mi)
+		require.Empty(t, s.mi.entries)
 	})
 
 	test.SyncTestRun("replacing a silence does not leak cache entries", t, func(t *testing.T) {
@@ -103,7 +103,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}
 		require.NoError(t, s.Set(t.Context(), sil1))
 		require.Len(t, s.st, 1)
-		require.Len(t, s.mi, 1)
+		require.Len(t, s.mi.entries, 1)
 		// must clone sil1 before replacing it.
 		sil2 := cloneSilence(sil1)
 		sil2.MatcherSets = []*pb.MatcherSet{{
@@ -115,7 +115,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}}
 		require.NoError(t, s.Set(t.Context(), sil2))
 		require.Len(t, s.st, 2)
-		require.Len(t, s.mi, 2)
+		require.Len(t, s.mi.entries, 2)
 		// Move time forward and both silence and cache entry should be garbage
 		// collected.
 		time.Sleep(time.Minute)
@@ -123,7 +123,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 2, n)
 		require.Empty(t, s.st)
-		require.Empty(t, s.mi)
+		require.Empty(t, s.mi.entries)
 	})
 
 	// This test checks for a memory leak that occurred in the matcher cache when
@@ -146,7 +146,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}
 		s.st["1"] = &pb.MeshSilence{Silence: sil1, ExpiresAt: timestamppb.New(now.Add(time.Minute))}
 		s.indexSilence(sil1)
-		require.Len(t, s.mi, 1)
+		require.Len(t, s.mi.entries, 1)
 		// must clone sil1 before updating it.
 		sil2 := cloneSilence(sil1)
 		require.NoError(t, s.Set(t.Context(), sil2))
@@ -155,7 +155,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		// This check asserts that this no longer happens.
 		s.Query(t.Context(), QMatches(model.LabelSet{"foo": "bar"}))
 		require.Len(t, s.st, 1)
-		require.Len(t, s.mi, 1)
+		require.Len(t, s.mi.entries, 1)
 		// Move time forward and both silence and cache entry should be garbage
 		// collected.
 		time.Sleep(time.Minute)
@@ -163,7 +163,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 1, n)
 		require.Empty(t, s.st)
-		require.Empty(t, s.mi)
+		require.Empty(t, s.mi.entries)
 	})
 
 	test.SyncTestRun("GC collects silences in multiple rounds", t, func(t *testing.T) {
@@ -251,14 +251,14 @@ func TestSilenceGCOverTime(t *testing.T) {
 		}
 
 		require.Len(t, s.st, 60)
-		require.Len(t, s.mi, 60)
+		require.Len(t, s.mi.entries, 60)
 
 		// First GC: nothing should be collected yet
 		n, err := s.GC()
 		require.NoError(t, err)
 		require.Equal(t, 0, n)
 		require.Len(t, s.st, 60)
-		require.Len(t, s.mi, 60)
+		require.Len(t, s.mi.entries, 60)
 
 		// Advance time to 91 minutes - Group 1 should be GC'd
 		time.Sleep(91 * time.Minute)
@@ -266,7 +266,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 10, n)
 		require.Len(t, s.st, 50)
-		require.Len(t, s.mi, 50)
+		require.Len(t, s.mi.entries, 50)
 
 		// Advance time to 106 minutes - Group 2 should be GC'd
 		time.Sleep(15 * time.Minute)
@@ -274,7 +274,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 10, n)
 		require.Len(t, s.st, 40)
-		require.Len(t, s.mi, 40)
+		require.Len(t, s.mi.entries, 40)
 
 		// Advance time to 121 minutes - Group 3 should be GC'd
 		time.Sleep(15 * time.Minute)
@@ -282,7 +282,7 @@ func TestSilenceGCOverTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 10, n)
 		require.Len(t, s.st, 30)
-		require.Len(t, s.mi, 30)
+		require.Len(t, s.mi.entries, 30)
 
 		// Verify all remaining silences are active
 		for id := range s.st {

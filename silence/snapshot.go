@@ -30,7 +30,7 @@ func (s *Silences) loadSnapshot(r io.Reader) error {
 		return err
 	}
 
-	mi := make(matcherIndex, len(st)) // for a map, len is ok as a size hint.
+	mi := newMatcherIndex(len(st)) // for a map, len is ok as a size hint.
 	// Choose new version index capacity with some growth buffer.
 	vi := make(versionIndex, 0, max(len(st)*5/4, 1024))
 
@@ -41,7 +41,7 @@ func (s *Silences) loadSnapshot(r io.Reader) error {
 			e.Silence.CreatedBy = e.Silence.Comments[0].Author
 			e.Silence.Comments = nil
 		}
-		// Add to matcher index, and only if successful, to the new state.
+		// Add to the matcher index, and only if successful, to the new state.
 		if _, err := mi.add(e.Silence); err != nil {
 			s.metrics.matcherCompileLoadSnapshotErrorsTotal.Inc()
 			s.logger.Error("Failed to compile silence matchers during snapshot load", "silence_id", e.Silence.Id, "err", err)

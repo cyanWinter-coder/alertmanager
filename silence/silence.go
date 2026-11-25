@@ -110,7 +110,7 @@ func New(o Options) (*Silences, error) {
 	}
 
 	s := &Silences{
-		mi:        make(matcherIndex, 512),
+		mi:        newMatcherIndex(512),
 		vi:        make(versionIndex, 0, 512),
 		logger:    promslog.NewNopLogger(),
 		retention: o.Retention,

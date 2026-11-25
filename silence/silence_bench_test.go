@@ -632,7 +632,7 @@ func benchmarkGC(b *testing.B, numSilences int, expiredRatio float64) {
 		require.Equal(b, numExpired, n1)
 		require.Equal(b, 0, n2)
 		require.Len(b, s.st, numActive)
-		require.Len(b, s.mi, numActive)
+		require.Len(b, s.mi.entries, numActive)
 		b.StartTimer()
 	}
 }

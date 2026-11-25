@@ -335,7 +335,7 @@ func TestQMatches(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		silences := &Silences{mi: matcherIndex{}, st: state{}}
+		silences := &Silences{mi: newMatcherIndex(0), st: state{}}
 		silences.mi.add(c.sil)
 		drop, err := f(c.sil, silences, time.Time{})
 		require.NoError(t, err)
